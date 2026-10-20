@@ -1,7 +1,11 @@
-# OG Club staking, furniture and raffles
+# OG Club clubs, staking, furniture and raffles
 
 OG Club awards ERC-1155 furniture through raffles paid with nontransferable points
 accrued by staking OG. There are no lootboxes or token-paid furniture purchases.
+`OGClubClubs` adds transferable ERC-721 rooms bought with OG. Furniture can be
+placed in a room permanently; the on-chain layout and its contents follow the
+club when it is sold. All pre-existing contracts are unchanged from the delivered
+raffle repository at `fabe4c1d998206e1b1bdf9bdf0f03fb6773a7707`.
 This Foundry project uses the existing Solidity 0.8.26/Cancun configuration and
 vendored OpenZeppelin 5.0.2 / forge-std 1.9.7 dependencies ([VENDOR.md](VENDOR.md)).
 Builds and tests require no RPC, secrets, FFI, or downloaded dependencies.
@@ -10,7 +14,7 @@ Builds and tests require no RPC, secrets, FFI, or downloaded dependencies.
 
 All constructors are nonpayable, use explicit owners, and make no dependency
 calls. They can run on an empty chain through the launch factory. Contracts are
-immutable implementations, without proxies, upgrades, pauses or owner sweeps.
+immutable implementations, without proxies, upgrades, transfer pauses or owner sweeps.
 Ownership uses OpenZeppelin's two-step transfer. Libraries are internal/inlined.
 
 | Contract | Constructor arguments, in order |
@@ -20,9 +24,11 @@ Ownership uses OpenZeppelin's two-step transfer. Libraries are internal/inlined.
 | `OGClubFarmVault` | token, owner |
 | `OGClubStaking` | token, immutable vault, owner, pointsPerTokenDay |
 | `OGClubRaffle` | staking, furniture, owner, immutable raffleNotice |
+| `OGClubClubs` | token, vault, price, furniture, owner, royaltyReceiver |
 
 The supplied `launch.json` is for **Sepolia, chain ID 11155111**, and deploys these
-five contracts in that order. `$owner` is the launch's configured owner; contract
+six contracts in that order. `$owner` is the launch's configured owner
+(`0x5b95a971b4583a5f011e9da082acdd679b870d06`); contract
 references resolve to the preceding deployments. MockOG deliberately has
 unrestricted minting, so anyone can acquire arbitrary stake and raffle points on
 this test network. Its initial trillion-token supply is not a cap. Do not reuse
@@ -65,8 +71,161 @@ For a separate **mainnet** launch:
   `POINTS_PER_TOKEN_DAY` (default 1e18). Its `deploy` helper builds the four
   production applications; `deploySepolia` additionally creates MockOG and is
   restricted to Sepolia/local chain IDs. Both leave role grants to the owner.
+  This existing script remains the raffle-stack helper; the separate club
+  scripts described below add the new application.
 
 No contract has been deployed or broadcast as part of this work.
+
+## Clubs: purchase, placement and rendering
+
+Clubs are named **OG Club Clubs**, symbol **OGCLUBS**. Each starts empty and IDs
+increase from one without a supply cap. Approve exactly `price` OG units, then
+call `mintClub()` or `mintClubTo(to)`. The caller pays in either case; the latter
+can gift a club to a different wallet. Contract recipients must accept safe
+ERC-721 delivery. Both entry points return the minted ID and guard reentrancy.
+The sale starts closed; its owner may open or close new purchases without
+restricting club transfers or furniture placements.
+
+Each purchase sends `floor(price / 2)` directly from the payer to
+`0x000000000000000000000000000000000000dEaD`, and the remainder directly to the
+immutable farm vault. An odd price gives the vault the extra unit. This is a
+transfer to a sink, not an ERC-20 supply reduction. Both recipient increases and
+the payer's total debit must match exactly or the entire purchase reverts,
+including payments, allowance consumption and ID allocation. No club payment
+passes through the clubs contract. The immutable vault cannot be the clubs
+contract itself. A vault equal to the burn sink cannot pass the distinct
+recipient accounting.
+
+Use a standard fixed-balance OG token. Transfer taxes, extra sender fees,
+rebasing/reflection behavior and dishonest balance reporting are unsupported.
+No-return ERC-20 transfers are supported through SafeERC20. The zero-OG-custody
+invariant covers protocol operations: an ERC-20 can still be sent to the
+contract unsolicited, and such donations are irrecoverable. Club revenue
+increases the existing farm vault's balance and therefore its season budget
+under the vault's unchanged 50% rule.
+
+To place furniture, transfer **one** unit of the configured `OGClubFurniture`:
+
+```solidity
+furniture.safeTransferFrom(
+    from,
+    address(clubs),
+    furnitureId,
+    1,
+    abi.encode(uint256(clubId), uint8(x), uint8(y), uint8(rot))
+);
+```
+
+The owner must first register the furniture ID with `setFootprint(id, w, h)`;
+both dimensions are 1 through 4. An unused ID's dimensions can change, but the
+first successful placement locks that ID's footprint globally and permanently.
+Failed placements do not lock it. IDs, including zero, are otherwise unrestricted.
+
+The room is 10 by 10, with coordinates 0 through 9. `(0,4)` is the door and
+`(1,4)` is its approach; both remain free. Rotation is 0, 1, 2 or 3; 1 and 3
+swap width and height, anchored at the supplied top-left coordinate. The whole
+rectangle must fit and cannot overlap existing furniture or either door tile.
+`OutOfRoom` also rejects invalid rotations. The defensive limit is 100 pieces,
+but **only 98 one-tile pieces can actually fit** after reserving the door.
+Tests exercise a full valid 98-piece room, rejected further placements, and the
+100-piece guard separately with test-only synthetic storage.
+
+Placement authenticates the ERC-1155 **`from` address** as the club's current
+owner, token-approved account, or operator approved for all that owner's clubs.
+It separately relies on furniture's normal transfer approval. A
+furniture-approved operator can therefore permanently place a holder's pieces
+into that holder's club even without a club approval. Conversely, a club
+approval does not allow spending someone else's furniture without their ERC-1155
+approval. Approving either asset has these trust implications.
+
+Only the immutable furniture contract can call the single-item hook, and layout
+data must be exactly the four ABI words above with canonical `uint8` values.
+The batch receiver hook always reverts. The unchanged OpenZeppelin 5.0.2
+furniture implementation routes **one-element batches through the single-item
+hook**; these are indistinguishable from single transfers and undergo all the
+same checks and recording. Empty and multi-element batches revert. Direct
+minting into clubs fails because the mint's `from` address is zero.
+
+Every successful placement emits
+`FurniturePlaced(clubId, furnitureId, x, y, rot, index)` with a zero-based
+placement index, then ERC-4906 `MetadataUpdate(clubId)`. Purchases emit
+`ClubMinted(id, to, payer, burned, toVault)`. Renderers can use:
+
+| View | Result |
+| --- | --- |
+| `piecesOf(clubId)` | `Piece { uint256 furnitureId; uint8 x; uint8 y; uint8 rot; }[]` in placement order |
+| `pieceCount(clubId)` | Number of placed pieces |
+| `tileTaken(clubId, x, y)` | Whether furniture occupies that tile; reserved door tiles return false |
+| `footprintOf(id)` | `(uint8 w, uint8 h, bool set, bool locked)` |
+| `tokenByIndex`, `tokenOfOwnerByIndex`, `totalSupply` | Standard ERC-721 enumeration, updated on transfers |
+| `token`, `vault`, `price`, `furniture`, `saleOpen` | Payment, asset and sale configuration |
+
+Club layout views and `tokenURI` reject missing clubs with `NonexistentToken`.
+`tileTaken` rejects coordinates outside the grid. Club transfers preserve every
+piece and occupied tile, invalidate token-specific approvals, and immediately
+change who can place. Furniture stays in the clubs contract forever. There is
+no function to remove, move, approve, burn or withdraw that furniture, or to burn
+a club. Contract ownership gives no privileged club transfer or free mint.
+
+The owner can set the metadata prefix until `freezeMetadata()`. `tokenURI(id)`
+returns `baseURI + decimal id + ".json"` (initially, for example, `1.json`).
+Both prefix changes and freezing emit `BatchMetadataUpdate(1, uint256.max)`.
+Freezing is permanent across ownership transfers and freezes the **URI prefix**;
+it does not freeze layouts, unused footprint definitions or content hosted at a
+mutable URL. Placements continue to emit metadata updates. Royalties start at
+500 bps (5%); `setRoyalty(receiver, bps)` accepts a nonzero receiver and 0–1000
+bps. Marketplace enforcement is external. Admin ownership uses Ownable2Step,
+including its standard cancellation and renunciation behavior.
+
+## Club deployment preparation
+
+`launch.json` retains the five original Sepolia entries and appends
+`OGClubClubs(MockOG, OGClubFarmVault, 100_000e18, OGClubFurniture, $owner, $owner)`.
+All constructors are static, nonpayable and avoid dependency calls. The factory
+performs constructor deployments only: **clubs start with the sale closed,
+empty metadata and no registered footprints**. The owner sets the catalogue and
+metadata and opens the sale when ready. These are normal owner operations, not
+an initializer. The clubs contract requires no minter or spender grant, and it
+does not consume either existing contract's raffle bootstrap.
+
+`script/DeployClubs.s.sol` contains two separate preparation scripts:
+
+| Script | Dependencies and configuration | Final club sale |
+| --- | --- | --- |
+| `DeployClubsSepolia` | Creates the repo's MockOG, OGClubFurniture and OGClubFarmVault; price is the named `CLUB_PRICE = 100_000e18` constant. Takes `OWNER`, optional `ROYALTY_RECEIVER` (defaults to owner), and optional `FOOTPRINTS_JSON`. Allows Sepolia and local chain 31337. | Open |
+| `DeployClubsMainnet` | Takes `OG_TOKEN`, `FARM_VAULT`, `CLUB_PRICE` in base units, `FURNITURE`, `OWNER`, `ROYALTY_RECEIVER`, and optional `FOOTPRINTS_JSON`. Creates only OGClubClubs using those existing dependencies. Allows mainnet and local chain 31337. | Closed |
+
+Both print each deployed address and its ABI-encoded constructor arguments;
+clubs' arguments are also printed individually. They do not read private keys.
+Owner-only footprint and sale calls use `OWNER` as broadcaster, with no temporary
+script ownership. These calls require that owner's authorization. For a Safe
+owner or a constructor-only factory launch, use the constructor deployment and
+have the Safe execute the configuration calls separately; a script or relayer
+cannot impersonate the Safe on-chain. No on-chain addresses are invented here.
+
+Footprint JSON is an array of `[furnitureId, width, height]` rows. The parser
+rejects duplicate IDs, malformed rows and dimensions outside 1–4 before creating
+any contracts. `script/club-footprints.json` deliberately contains `[]`: the
+brief supplies no catalogue, and IDs/dimensions remain owner-configurable.
+Populate it with the actual catalogue before opening a placement experience.
+The scripts also accept `[]`, which leaves all IDs unset. Pass the file contents
+through `FOOTPRINTS_JSON`; this avoids changing the protected Foundry filesystem
+permissions. For example, a **local simulation** with the configured owner is:
+
+```sh
+FOOTPRINTS_JSON="$(cat script/club-footprints.json)" \
+  forge script script/DeployClubs.s.sol:DeployClubsSepolia \
+  --chain-id 11155111 --sender "$OWNER"
+```
+
+The Sepolia script opens the sale even when the catalogue is empty, so clubs can
+be purchased before furnishing is enabled. Mainnet always leaves the sale
+closed for the owner to review. MockOG is freely mintable and tests accounting,
+not payment scarcity or real burn economics; it must never be used for
+production. The old raffle's first-grant sequence remains required before
+opening raffles, and independent monitoring must draw each closed raffle while
+its target block hash is available. See the audit reproductions and disposition
+in [ADAPTATION.md](ADAPTATION.md).
 
 ## Staking and points
 
@@ -274,7 +433,7 @@ forge test --match-contract GasTest --isolate -vv
 
 ```sh
 forge build
-FOUNDRY_FUZZ_SEED=0x4527dd7e19d2b4b8167581d582f24426775869593d2ed8fe03317cc41c942f06 forge test
+FOUNDRY_FUZZ_SEED=0xf236bdc08e156b1d158e98af99b4b7c3d0e8797c8771799ec73b9c326a3f8fff forge test
 forge fmt --check
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s test -p 'test_*.py' -v
 ```
@@ -288,3 +447,11 @@ minus spending, and vault balances against all remaining reservations. The
 retained furniture suite checks supply, transfer authorization, royalties and
 frozen metadata. [ADAPTATION.md](ADAPTATION.md) records the changes and audit
 reproductions.
+
+Club tests cover exact payment splitting and rollback, safe receivers,
+reentrancy, real furniture integration, all rotations, authorization, permanent
+custody, metadata, royalties and script/factory deployment. Fuzz tests compare
+random placement sequences against an independent cell grid. Stateful club
+invariants exercise minting, rejected placements, sale changes and transfers,
+checking payment conservation, zero protocol OG custody, and an exact match
+between per-ID furniture holdings and all clubs' ordered layouts.

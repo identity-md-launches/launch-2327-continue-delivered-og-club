@@ -18,6 +18,10 @@ class LaunchManifestTest(unittest.TestCase):
             ("OGClubFarmVault", ["$contract:MockOG", "$owner"]),
             ("OGClubStaking", ["$contract:MockOG", "$contract:OGClubFarmVault", "$owner", "1000000000000000000"]),
             ("OGClubRaffle", ["$contract:OGClubStaking", "$contract:OGClubFurniture", "$owner", "0"]),
+            ("OGClubClubs", [
+                "$contract:MockOG", "$contract:OGClubFarmVault", "100000000000000000000000",
+                "$contract:OGClubFurniture", "$owner", "$owner",
+            ]),
         ]
         self.assertEqual([(c["contract"], c["constructorArgs"]) for c in manifest["contracts"]], expected)
         seen = set()
@@ -41,6 +45,8 @@ class LaunchManifestTest(unittest.TestCase):
         self.assertIn("FIRST grant", manifest["notes"])
         self.assertIn("604800", manifest["notes"])
         self.assertNotIn("OGClubBox", seen)
+        self.assertIn("sale closed", manifest["notes"])
+        self.assertIn("98", manifest["notes"])
 
 
 if __name__ == "__main__":
